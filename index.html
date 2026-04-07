@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Interactive TCM – HTML/JS</title>
+<style>
+  :root{
+    --bg:#0b0f17; --card:#121826; --ink:#e6eefc; --muted:#97a3b6; --grid:#1f2737;
+    --accent:#66c2a5;
+  }
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
+  .wrap{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto auto;gap:16px;padding:18px}
+  .card{background:var(--card);border:1px solid #1a2335;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.35);padding:12px 12px 16px}
+  .title{margin:0 0 8px;font-weight:700}
+  .subtle{color:var(--muted);font-size:12px}
+  svg{width:100%;height:300px;display:block;touch-action:none}
+  .axis{stroke:var(--grid);stroke-width:1;fill:none}
+  .grid line{stroke:var(--grid);stroke-width:1}
+  .label{fill:var(--ink);font-size:12px}
+  table{width:100%;border-collapse:collapse;color:var(--ink);font-size:14px}
+  th,td{border:1px solid #222c43;padding:6px 8px;text-align:center}
+  th{background:#141e33;font-weight:700}
+  .hint{margin-top:6px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h3 class="title">Normalized Label <span class="subtle">(Click & drag)</span></h3>
+      <svg id="chartA" aria-label="Chart A"></svg>
+      <div class="hint">Bars are L1-normalized so they sum to 1. Values clipped to [0, 1].</div>
+    </div>
+    <div class="card">
+      <h3 class="title">Normalized Prediction <span class="subtle">(Click & drag)</span></h3>
+      <svg id="chartB" aria-label="Chart B"></svg>
+      <div class="hint">Bars are L1-normalized so they sum to 1. Values clipped to [0, 1].</div>
+    </div>
+    <div class="card">
+      <h3 class="title">From Prediction to Label via TCM Contribution</h3>
+      <svg id="chartStack" aria-label="Stacked from M"></svg>
+    </div>
+    <div class="card">
+      <h3 class="title">TCM Contribution</h3>
+      <div id="matrixTable"></div>
+    </div>
+  </div>
+
+<script>
+// ======== Config ========
+const C = 4;                              // number of classes
+const FIXED_YMAX = 0.75;                  // bar chart y max
+const labels = Array.from({length:C}, (_,i)=>`c${i+1}`);
+// ColorBrewer Set2 (8 colors); we use first C
+const set2 = ['#66c2a5','#fc8d62','#8da0cb','#e78ac3','#a6d854','#ffd92f','#e5c494','#b3b3b3'];
+const colors = set2.slice(0, C);
+
+function hexToRgb(hex){
+  const h = hex.replace('#','');
+  const bigint = parseInt(h.length===3 ? h.split('').map(x=>x+x).join('') : h, 16);
+  return {r:(bigint>>16)&255, g:(bigint>>8)&255, b:bigint&255};
+}
+function rgbToHex(r,g,b){
+  const toHex = v => v.toString(16).padStart(2,'0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+function darken(hex, factor=0.8){
+  const {r,g,b} = hexToRgb(hex);
+  const dr = Math.max(0, Math.min(255, Math.round(r*factor)));
+  const dg = Math.max(0, Math.min(255, Math.round(g*factor)));
+  const db = Math.max(0, Math.min(255, Math.round(b*factor)));
+  return rgbToHex(dr,dg,db);
+}
+
+function clamp(x, lo=0, hi=1){ return Math.max(lo, Math.min(hi, x)); }
+function sum(arr){ return arr.reduce((a,b)=>a+b,0); }
+function l1norm(v){ return Math.max(1e-12, sum(v.map(Math.abs))); }
+function normalizeL1(v){
+  const s = l1norm(v);
+  return v.map(x => x / s);
+}
+
+// Compute M per spec: L1-normalize a,b; m=min(a,b); ra=a-m; rb=b-m; M = diag(m)+ outer(ra,rb)/||ra||_1
+function computeM(a, b){
+  const aN = normalizeL1(a.map(x=>clamp(x)));
+  const bN = normalizeL1(b.map(x=>clamp(x)));
+  const m = aN.map((v,i)=> Math.min(v, bN[i]));
+  const ra = aN.map((v,i)=> v - m[i]);
+  const rb = bN.map((v,i)=> v - m[i]);
+  const denom = Math.max(1e-12, l1norm(ra));
+  // build matrix
+  const M = Array.from({length:C}, (_,i)=> Array.from({length:C}, (_,j)=> (i===j? m[i]:0) + (ra[i]*rb[j])/denom ));
+  return M;
+}
+
+// ======== Generic SVG bar chart (interactive option) ========
+function createBarChart({svg, values, colors, interactive=true, title='', onChange}){
+  const n = values.length;
+  const W = svg.clientWidth || 380;
+  const H = 300;
+  const margin = {top:14, right:10, bottom:32, left:32};
+  const iw = W - margin.left - margin.right;
+  const ih = H - margin.top - margin.bottom;
+
+  // clear
+  svg.replaceChildren();
+  const g = svg.appendChild(el('g',{transform:`translate(${margin.left},${margin.top})`}));
+
+  // grid + axis box
+  const grid = g.appendChild(el('g',{class:'grid'}));
+  const levels = 5; // 0..1 in steps of 0.25
+  for(let k=0;k<=levels;k++){
+    const y = ih * (1 - k/levels);
+    grid.appendChild(el('line',{x1:0,y1:y,x2:iw,y2:y}));
+  }
+  g.appendChild(el('rect',{x:0,y:0,width:iw,height:ih,class:'axis'}));
+
+  const gap = 14;
+  const barW = (iw - gap*(n-1)) / n;
+
+  const barsG = g.appendChild(el('g'));
+  const labelsG = g.appendChild(el('g'));
+  const hitsG = g.appendChild(el('g'));
+
+  const state = {drag:false, idx:null};
+  let vals = values.slice();
+
+  function draw(){
+    barsG.replaceChildren(); labelsG.replaceChildren(); hitsG.replaceChildren();
+    vals.forEach((v,i)=>{
+      const x = i*(barW+gap);
+      const h = ih * clamp(v, 0, FIXED_YMAX) / FIXED_YMAX; // map to fixed ymax
+      const y = ih - h;
+      const fill = colors[i];
+      const stroke = darken(fill, 0.8);
+      const bar = el('rect',{x, y, width:barW, height:h, fill:fill, stroke:stroke, 'stroke-width':1.5});
+      barsG.appendChild(bar);
+
+      const lbl = el('text',{class:'label','text-anchor':'middle', x:x+barW/2, y: Math.max(0,y-6)});
+      lbl.textContent = v.toFixed(2);
+      labelsG.appendChild(lbl);
+
+      const tick = el('text',{class:'label','text-anchor':'middle', x:x+barW/2, y: ih+18});
+      tick.textContent = `c${i+1}`;
+      labelsG.appendChild(tick);
+
+      const hit = el('rect',{x, y:0, width:barW, height:ih, fill:'transparent', style:'cursor:ns-resize'});
+      if (interactive) hit.addEventListener('pointerdown', e=>startDrag(e,i));
+      hitsG.appendChild(hit);
+    });
+    // big background drag zone
+    if (interactive) {
+      const bg = el('rect',{x:0,y:0,width:iw,height:ih,fill:'transparent'});
+      bg.addEventListener('pointerdown', e=> startDrag(e, getIndexFromX(e)) );
+      hitsG.appendChild(bg);
+    }
+  }
+
+  function getIndexFromX(e){
+    const pt = clientToLocal(e, svg, g);
+    const x = clamp(pt.x, 0, iw-0.001);
+    const slot = Math.floor(x / (barW+gap));
+    return Math.max(0, Math.min(n-1, slot));
+  }
+
+  function setByEvent(e){
+    if(!state.drag) return;
+    const pt = clientToLocal(e, svg, g);
+    const y = Math.max(0, Math.min(ih, pt.y));
+    const v = clamp(1 - y/ih, 0, 1) * FIXED_YMAX; // raw v in [0, FIXED_YMAX]
+    vals[state.idx] = v;
+    // L1 normalization to sum to 1 (on the unclipped [0,1] scale)
+    const unclipped = vals.map(x=> clamp(x,0,1));
+    const s = l1norm(unclipped);
+    if (s>0) {
+      vals = unclipped.map(x=> x/s); // normalized to 1
+    } else {
+      vals = Array(n).fill(0); vals[state.idx] = 1; // degenerate case
+    }
+
+    draw();
+    onChange && onChange(vals.slice());
+  }
+
+  function startDrag(e,i){
+    e.preventDefault();
+    state.drag = true; state.idx = i;
+    svg.setPointerCapture(e.pointerId);
+    setByEvent(e);
+  }
+  function endDrag(e){
+    if(!state.drag) return; state.drag=false; state.idx=null;
+    try{ svg.releasePointerCapture(e.pointerId); }catch{}
+  }
+
+  if (interactive){
+    svg.addEventListener('pointermove', setByEvent);
+    svg.addEventListener('pointerup', endDrag);
+    svg.addEventListener('pointercancel', endDrag);
+    window.addEventListener('resize', ()=> createBarChart({svg, values:vals, colors, interactive, onChange}));
+  }
+
+  draw();
+
+  return {
+    setValues(v){ vals = v.slice(); draw(); },
+    getValues(){ return vals.slice(); }
+  };
+}
+
+// ======== Stacked-from-M chart ========
+function createStackedChart({svg, colors}){
+  const W = svg.clientWidth || 380; const H = 300;
+  const margin = {top:14, right:10, bottom:32, left:32};
+  const iw = W - margin.left - margin.right;
+  const ih = H - margin.top - margin.bottom;
+  svg.replaceChildren();
+  const g = svg.appendChild(el('g',{transform:`translate(${margin.left},${margin.top})`}));
+  const grid = g.appendChild(el('g',{class:'grid'}));
+  for(let k=0;k<=5;k++){
+    const y = ih * (1 - k/5);
+    grid.appendChild(el('line',{x1:0,y1:y,x2:iw,y2:y}));
+  }
+  g.appendChild(el('rect',{x:0,y:0,width:iw,height:ih,class:'axis'}));
+
+  const gap=14; const barW=(iw - gap*(C-1))/C;
+  function render(M){
+    g.querySelectorAll('.bars,.labels').forEach(n=>n.remove());
+    const barsG = g.appendChild(el('g',{class:'bars'}));
+    const labelsG = g.appendChild(el('g',{class:'labels'}));
+    for(let i=0;i<C;i++){
+      let bottom = 0;
+      const order = [i, ...Array.from({length:C},(_,j)=>j).filter(j=>j!==i)];
+      for(const j of order){
+        const h = Math.max(0, M[i][j]);
+        if (h<=0) continue;
+        const x = i*(barW+gap);
+        const segH = ih * (h/ FIXED_YMAX);
+        const y = ih - (bottom + h)/FIXED_YMAX * ih;
+        const fill = colors[j];
+        const stroke = darken(fill, 0.8);
+        barsG.appendChild(el('rect',{x, y, width:barW, height:segH, fill:fill, stroke:stroke, 'stroke-width':1.2}));
+        bottom += h;
+      }
+      const xMid = i*(barW+gap)+barW/2;
+      const lbl = el('text',{class:'label','text-anchor':'middle', x:xMid, y: Math.max(0, ih - (bottom/ FIXED_YMAX)*ih - 6)});
+      lbl.textContent = (M[i].reduce((a,b)=>a+b,0)).toFixed(2);
+      labelsG.appendChild(lbl);
+
+      const tick = el('text',{class:'label','text-anchor':'middle', x:xMid, y: ih+18});
+      tick.textContent = `c${i+1}`;
+      labelsG.appendChild(tick);
+    }
+  }
+  return { render };
+}
+
+// ======== Matrix table ========
+function renderMatrixTable(container, M){
+  const n = M.length;
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const trh = document.createElement('tr');
+  trh.appendChild(document.createElement('th')); // corner
+  for(let j=0;j<n;j++){ const th=document.createElement('th'); th.textContent=`c${j+1}`; trh.appendChild(th);} 
+  thead.appendChild(trh); table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for(let i=0;i<n;i++){
+    const tr=document.createElement('tr');
+    const th=document.createElement('th'); th.textContent=`c${i+1}`; tr.appendChild(th);
+    for(let j=0;j<n;j++){
+      const td=document.createElement('td'); td.textContent = M[i][j].toFixed(2); tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  container.replaceChildren(table);
+}
+
+// ======== DOM helpers ========
+function el(tag, attrs={}){ const n=document.createElementNS('http://www.w3.org/2000/svg', tag); for(const[k,v] of Object.entries(attrs)) n.setAttribute(k,v); return n; }
+function clientToLocal(e, svg, g){ const pt=svg.createSVGPoint(); pt.x=e.clientX; pt.y=e.clientY; const ctm=g.getScreenCTM().inverse(); return pt.matrixTransform(ctm); }
+
+// ======== Wire up ========
+const svgA = document.getElementById('chartA');
+const svgB = document.getElementById('chartB');
+const svgStack = document.getElementById('chartStack');
+const tbl = document.getElementById('matrixTable');
+
+let aVals = normalizeL1(Array.from({length:C}, ()=> Math.random()));
+let bVals = normalizeL1(Array.from({length:C}, ()=> Math.random()));
+
+const stacked = createStackedChart({svg: svgStack, colors});
+const chartA = createBarChart({svg: svgA, values: aVals, colors, interactive:true, onChange: v=>{ aVals=v; refresh(); }});
+const chartB = createBarChart({svg: svgB, values: bVals, colors, interactive:true, onChange: v=>{ bVals=v; refresh(); }});
+
+function refresh(){
+  const M = computeM(aVals, bVals);
+  stacked.render(M);
+  renderMatrixTable(tbl, M);
+}
+
+refresh();
+</script>
+</body>
